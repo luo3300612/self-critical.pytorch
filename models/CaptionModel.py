@@ -9,7 +9,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -99,12 +98,11 @@ class CaptionModel(nn.Module):
 
         # Start diverse_beam_search
         opt = kwargs['opt']
-        temperature = opt.get('temperature', 1) # This should not affect beam search, but will affect dbs
         beam_size = opt.get('beam_size', 10)
         group_size = opt.get('group_size', 1)
         diversity_lambda = opt.get('diversity_lambda', 0.5)
         decoding_constraint = opt.get('decoding_constraint', 0)
-        remove_bad_endings = opt.get('remove_bad_endings', 0)
+        max_ppl = opt.get('max_ppl', 0)
         length_penalty = utils.penalty_builder(opt.get('length_penalty', ''))
         bdash = beam_size // group_size # beam per group
 
@@ -115,19 +113,14 @@ class CaptionModel(nn.Module):
 
         # logprobs # logprobs predicted in last time step, shape (beam_size, vocab_size+1)
         done_beams_table = [[] for _ in range(group_size)]
-        # state_table = [list(torch.unbind(_)) for _ in torch.stack(init_state).chunk(group_size, 2)]
-        state_table = list(zip(*[_.chunk(group_size, 1) for _ in init_state]))
+        state_table = [list(torch.unbind(_)) for _ in torch.stack(init_state).chunk(group_size, 2)]
         logprobs_table = list(init_logprobs.chunk(group_size, 0))
         # END INIT
 
         # Chunk elements in the args
         args = list(args)
-        if self.__class__.__name__ == 'AttEnsemble':
-            args = [[_.chunk(group_size) if _ is not None else [None]*group_size for _ in args_] for args_ in args] # arg_name, model_name, group_name
-            args = [[[args[j][i][k] for i in range(len(self.models))] for j in range(len(args))] for k in range(group_size)] # group_name, arg_name, model_name
-        else:
-            args = [_.chunk(group_size) if _ is not None else [None]*group_size for _ in args]
-            args = [[args[i][j] for i in range(len(args))] for j in range(group_size)]
+        args = [_.chunk(group_size) if _ is not None else [None]*group_size for _ in args]
+        args = [[args[i][j] for i in range(len(args))] for j in range(group_size)]
 
         for t in range(self.seq_length + group_size - 1):
             for divm in range(group_size): 
@@ -137,8 +130,6 @@ class CaptionModel(nn.Module):
                     # suppress previous word
                     if decoding_constraint and t-divm > 0:
                         logprobsf.scatter_(1, beam_seq_table[divm][t-divm-1].unsqueeze(1).cuda(), float('-inf'))
-                    if remove_bad_endings and t-divm > 0:
-                        logprobsf[torch.from_numpy(np.isin(beam_seq_table[divm][t-divm-1].cpu().numpy(), self.bad_endings_ix).astype('uint8')), 0] = float('-inf')
                     # suppress UNK tokens in the decoding
                     logprobsf[:,logprobsf.size(1)-1] = logprobsf[:, logprobsf.size(1)-1] - 1000  
                     # diversity is added here
@@ -171,6 +162,8 @@ class CaptionModel(nn.Module):
                                 'p': beam_logprobs_sum_table[divm][vix].item()
                             }
                             final_beam['p'] = length_penalty(t-divm+1, final_beam['p'])
+                            # if max_ppl:
+                            #     final_beam['p'] = final_beam['p'] / (t-divm+1)
                             done_beams_table[divm].append(final_beam)
                             # don't continue beams from finished sequences
                             beam_logprobs_sum_table[divm][vix] = -1000
@@ -179,49 +172,8 @@ class CaptionModel(nn.Module):
                     
                     it = beam_seq_table[divm][t-divm]
                     logprobs_table[divm], state_table[divm] = self.get_logprobs_state(it.cuda(), *(args[divm] + [state_table[divm]]))
-                    logprobs_table[divm] = F.log_softmax(logprobs_table[divm] / temperature, dim=-1)
 
         # all beams are sorted by their log-probabilities
         done_beams_table = [sorted(done_beams_table[i], key=lambda x: -x['p'])[:bdash] for i in range(group_size)]
         done_beams = reduce(lambda a,b:a+b, done_beams_table)
         return done_beams
-
-
-    def sample_next_word(self, logprobs, sample_method, temperature):
-        if sample_method == 'greedy':
-            sampleLogprobs, it = torch.max(logprobs.data, 1)
-            it = it.view(-1).long()
-        elif sample_method == 'gumbel': # gumbel softmax
-            # ref: https://gist.github.com/yzh119/fd2146d2aeb329d067568a493b20172f
-            def sample_gumbel(shape, eps=1e-20):
-                U = torch.rand(shape).cuda()
-                return -torch.log(-torch.log(U + eps) + eps)
-            def gumbel_softmax_sample(logits, temperature):
-                y = logits + sample_gumbel(logits.size())
-                return F.log_softmax(y / temperature, dim=-1)
-            _logprobs = gumbel_softmax_sample(logprobs, temperature)
-            _, it = torch.max(_logprobs.data, 1)
-            sampleLogprobs = logprobs.gather(1, it.unsqueeze(1)) # gather the logprobs at sampled positions
-        else:
-            logprobs = logprobs / temperature
-            if sample_method.startswith('top'): # topk sampling
-                top_num = float(sample_method[3:])
-                if 0 < top_num < 1:
-                    # nucleus sampling from # The Curious Case of Neural Text Degeneration
-                    probs = F.softmax(logprobs, dim=1)
-                    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=1)
-                    _cumsum = sorted_probs.cumsum(1)
-                    mask = _cumsum < top_num
-                    mask = torch.cat([torch.ones_like(mask[:,:1]), mask[:,:-1]], 1)
-                    sorted_probs = sorted_probs * mask.float()
-                    sorted_probs = sorted_probs / sorted_probs.sum(1, keepdim=True)
-                    logprobs.scatter_(1, sorted_indices, sorted_probs.log())
-                else:
-                    the_k = int(top_num)
-                    tmp = torch.empty_like(logprobs).fill_(float('-inf'))
-                    topk, indices = torch.topk(logprobs, the_k, dim=1)
-                    tmp = tmp.scatter(1, indices, topk)
-                    logprobs = tmp
-            it = torch.distributions.Categorical(logits=logprobs.detach()).sample()
-            sampleLogprobs = logprobs.gather(1, it.unsqueeze(1)) # gather the logprobs at sampled positions
-        return it, sampleLogprobs

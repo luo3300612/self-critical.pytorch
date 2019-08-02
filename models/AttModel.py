@@ -17,7 +17,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,9 +24,6 @@ import misc.utils as utils
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 
 from .CaptionModel import CaptionModel
-
-bad_endings = ['a','an','the','in','for','at','of','with','before','after','on','upon','near','to','is','are','am']
-bad_endings += ['the']
 
 def sort_pack_padded_sequence(input, lengths):
     sorted_lengths, indices = torch.sort(lengths, descending=True)
@@ -57,7 +53,7 @@ class AttModel(CaptionModel):
         self.rnn_size = opt.rnn_size
         self.num_layers = opt.num_layers
         self.drop_prob_lm = opt.drop_prob_lm
-        self.seq_length = getattr(opt, 'max_length', 20) or opt.seq_length # maximum sample length
+        self.seq_length = opt.max_length or opt.seq_length # maximum sample length
         self.fc_feat_size = opt.fc_feat_size
         self.att_feat_size = opt.att_feat_size
         self.att_hid_size = opt.att_hid_size
@@ -86,10 +82,6 @@ class AttModel(CaptionModel):
             self.logit = [[nn.Linear(self.rnn_size, self.rnn_size), nn.ReLU(), nn.Dropout(0.5)] for _ in range(opt.logit_layers - 1)]
             self.logit = nn.Sequential(*(reduce(lambda x,y:x+y, self.logit) + [nn.Linear(self.rnn_size, self.vocab_size + 1)]))
         self.ctx2att = nn.Linear(self.rnn_size, self.att_hid_size)
-
-        # For remove bad endding
-        self.vocab = opt.vocab
-        self.bad_endings_ix = [int(k) for k,v in self.vocab.items() if v in bad_endings]
 
     def init_hidden(self, bsz):
         weight = next(self.parameters())
@@ -121,7 +113,6 @@ class AttModel(CaptionModel):
         state = self.init_hidden(batch_size)
 
         outputs = fc_feats.new_zeros(batch_size, seq.size(1) - 1, self.vocab_size+1)
-
         # Prepare the features
         p_fc_feats, p_att_feats, pp_att_feats, p_att_masks = self._prepare_feature(fc_feats, att_feats, att_masks)
         # pp_att_feats is used for attention, we cache it in advance to reduce computation cost
@@ -193,12 +184,11 @@ class AttModel(CaptionModel):
 
     def _sample(self, fc_feats, att_feats, att_masks=None, opt={}):
 
-        sample_method = opt.get('sample_method', 'greedy')
+        sample_max = opt.get('sample_max', 1)
         beam_size = opt.get('beam_size', 1)
         temperature = opt.get('temperature', 1.0)
         decoding_constraint = opt.get('decoding_constraint', 0)
         block_trigrams = opt.get('block_trigrams', 0)
-        remove_bad_endings = opt.get('remove_bad_endings', 0)
         if beam_size > 1:
             return self._sample_beam(fc_feats, att_feats, att_masks, opt)
 
@@ -220,13 +210,6 @@ class AttModel(CaptionModel):
             if decoding_constraint and t > 0:
                 tmp = logprobs.new_zeros(logprobs.size())
                 tmp.scatter_(1, seq[:,t-1].data.unsqueeze(1), float('-inf'))
-                logprobs = logprobs + tmp
-
-            if remove_bad_endings and t > 0:
-                tmp = logprobs.new_zeros(logprobs.size())
-                prev_bad = np.isin(seq[:,t-1].data.cpu().numpy(), self.bad_endings_ix)
-                # Impossible to generate remove_bad_endings
-                tmp[torch.from_numpy(prev_bad.astype('uint8')), 0] = float('-inf')
                 logprobs = logprobs + tmp
 
             # Mess with trigrams
@@ -259,7 +242,18 @@ class AttModel(CaptionModel):
             # sample the next word
             if t == self.seq_length: # skip if we achieve maximum length
                 break
-            it, sampleLogprobs = self.sample_next_word(logprobs, sample_method, temperature)
+            if sample_max:
+                sampleLogprobs, it = torch.max(logprobs.data, 1)
+                it = it.view(-1).long()
+            else:
+                if temperature == 1.0:
+                    prob_prev = torch.exp(logprobs.data) # fetch prev distribution: shape Nx(M+1)
+                else:
+                    # scale logprobs by temperature
+                    prob_prev = torch.exp(torch.div(logprobs.data, temperature))
+                it = torch.multinomial(prob_prev, 1)
+                sampleLogprobs = logprobs.gather(1, it) # gather the logprobs at sampled positions
+                it = it.view(-1).long() # and flatten indices for downstream processing
 
             # stop when all finished
             if t == 0:
@@ -325,14 +319,14 @@ class AdaAtt_lstm(nn.Module):
             all_input_sums = i2h+self.h2h[L](prev_h)
 
             sigmoid_chunk = all_input_sums.narrow(1, 0, 3 * self.rnn_size)
-            sigmoid_chunk = torch.sigmoid(sigmoid_chunk)
+            sigmoid_chunk = F.sigmoid(sigmoid_chunk)
             # decode the gates
             in_gate = sigmoid_chunk.narrow(1, 0, self.rnn_size)
             forget_gate = sigmoid_chunk.narrow(1, self.rnn_size, self.rnn_size)
             out_gate = sigmoid_chunk.narrow(1, self.rnn_size * 2, self.rnn_size)
             # decode the write inputs
             if not self.use_maxout:
-                in_transform = torch.tanh(all_input_sums.narrow(1, 3 * self.rnn_size, self.rnn_size))
+                in_transform = F.tanh(all_input_sums.narrow(1, 3 * self.rnn_size, self.rnn_size))
             else:
                 in_transform = all_input_sums.narrow(1, 3 * self.rnn_size, 2 * self.rnn_size)
                 in_transform = torch.max(\
@@ -341,7 +335,7 @@ class AdaAtt_lstm(nn.Module):
             # perform the LSTM update
             next_c = forget_gate * prev_c + in_gate * in_transform
             # gated cells form the output
-            tanh_nex_c = torch.tanh(next_c)
+            tanh_nex_c = F.tanh(next_c)
             next_h = out_gate * tanh_nex_c
             if L == self.num_layers-1:
                 if L == 0:
@@ -349,7 +343,7 @@ class AdaAtt_lstm(nn.Module):
                 else:
                     i2h = self.r_i2h(x)
                 n5 = i2h+self.r_h2h(prev_h)
-                fake_region = torch.sigmoid(n5) * tanh_nex_c
+                fake_region = F.sigmoid(n5) * tanh_nex_c
 
             cs.append(next_c)
             hs.append(next_h)
@@ -408,7 +402,7 @@ class AdaAtt_attention(nn.Module):
         img_all = torch.cat([fake_region.view(-1,1,self.input_encoding_size), conv_feat], 1)
         img_all_embed = torch.cat([fake_region_embed.view(-1,1,self.input_encoding_size), conv_feat_embed], 1)
 
-        hA = torch.tanh(img_all_embed + txt_replicate)
+        hA = F.tanh(img_all_embed + txt_replicate)
         hA = F.dropout(hA,self.drop_prob_lm, self.training)
         
         hAflat = self.alpha_net(hA.view(-1, self.att_hid_size))
@@ -424,7 +418,7 @@ class AdaAtt_attention(nn.Module):
 
         atten_out = visAttdim + h_out_linear
 
-        h = torch.tanh(self.att2h(atten_out))
+        h = F.tanh(self.att2h(atten_out))
         h = F.dropout(h, self.drop_prob_lm, self.training)
         return h
 
@@ -560,7 +554,7 @@ class Attention(nn.Module):
         att_h = self.h2att(h)                        # batch * att_hid_size
         att_h = att_h.unsqueeze(1).expand_as(att)            # batch * att_size * att_hid_size
         dot = att + att_h                                   # batch * att_size * att_hid_size
-        dot = torch.tanh(dot)                                # batch * att_size * att_hid_size
+        dot = F.tanh(dot)                                # batch * att_size * att_hid_size
         dot = dot.view(-1, self.att_hid_size)               # (batch * att_size) * att_hid_size
         dot = self.alpha_net(dot)                           # (batch * att_size) * 1
         dot = dot.view(-1, att_size)                        # batch * att_size
@@ -599,7 +593,7 @@ class Att2in2Core(nn.Module):
 
         all_input_sums = self.i2h(xt) + self.h2h(state[0][-1])
         sigmoid_chunk = all_input_sums.narrow(1, 0, 3 * self.rnn_size)
-        sigmoid_chunk = torch.sigmoid(sigmoid_chunk)
+        sigmoid_chunk = F.sigmoid(sigmoid_chunk)
         in_gate = sigmoid_chunk.narrow(1, 0, self.rnn_size)
         forget_gate = sigmoid_chunk.narrow(1, self.rnn_size, self.rnn_size)
         out_gate = sigmoid_chunk.narrow(1, self.rnn_size * 2, self.rnn_size)
@@ -610,7 +604,7 @@ class Att2in2Core(nn.Module):
             in_transform.narrow(1, 0, self.rnn_size),
             in_transform.narrow(1, self.rnn_size, self.rnn_size))
         next_c = forget_gate * state[1][-1] + in_gate * in_transform
-        next_h = out_gate * torch.tanh(next_c)
+        next_h = out_gate * F.tanh(next_c)
 
         output = self.dropout(next_h)
         state = (next_h.unsqueeze(0), next_c.unsqueeze(0))
@@ -651,7 +645,7 @@ class Att2all2Core(nn.Module):
 
         all_input_sums = self.i2h(xt) + self.h2h(state[0][-1]) + self.a2h(att_res)
         sigmoid_chunk = all_input_sums.narrow(1, 0, 3 * self.rnn_size)
-        sigmoid_chunk = torch.sigmoid(sigmoid_chunk)
+        sigmoid_chunk = F.sigmoid(sigmoid_chunk)
         in_gate = sigmoid_chunk.narrow(1, 0, self.rnn_size)
         forget_gate = sigmoid_chunk.narrow(1, self.rnn_size, self.rnn_size)
         out_gate = sigmoid_chunk.narrow(1, self.rnn_size * 2, self.rnn_size)
@@ -661,7 +655,7 @@ class Att2all2Core(nn.Module):
             in_transform.narrow(1, 0, self.rnn_size),
             in_transform.narrow(1, self.rnn_size, self.rnn_size))
         next_c = forget_gate * state[1][-1] + in_gate * in_transform
-        next_h = out_gate * torch.tanh(next_c)
+        next_h = out_gate * F.tanh(next_c)
 
         output = self.dropout(next_h)
         state = (next_h.unsqueeze(0), next_c.unsqueeze(0))

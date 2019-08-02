@@ -117,8 +117,36 @@ class ShowTellModel(CaptionModel):
         # return the samples and their log likelihoods
         return seq.transpose(0, 1), seqLogprobs.transpose(0, 1)
 
+    def sample_beam(self, fc_feats, att_feats, att_masks=None, opt={}):
+        beam_size = opt.get('beam_size', 10)
+        batch_size = fc_feats.size(0)
+
+        assert beam_size <= self.vocab_size + 1, 'lets assume this for now, otherwise this corner case causes a few headaches down the road. can be dealt with in future if needed'
+        seq = torch.LongTensor(self.seq_length, batch_size).zero_()
+        seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
+        # lets process every image independently for now, for simplicity
+
+        self.done_beams = [[] for _ in range(batch_size)]
+        for k in range(batch_size):
+            state = self.init_hidden(beam_size)
+            for t in range(2):
+                if t == 0:
+                    xt = self.img_embed(fc_feats[k:k+1]).expand(beam_size, self.input_encoding_size)
+                elif t == 1: # input <bos>
+                    it = fc_feats.data.new(beam_size).long().zero_()
+                    xt = self.embed(it)
+
+                output, state = self.core(xt.unsqueeze(0), state)
+                logprobs = F.log_softmax(self.logit(self.dropout(output.squeeze(0))), dim=1)
+
+            self.done_beams[k] = self.beam_search(state, logprobs, opt=opt)
+            seq[:, k] = self.done_beams[k][0]['seq'] # the first beam has highest cumulative score
+            seqLogprobs[:, k] = self.done_beams[k][0]['logps']
+        # return the samples and their log likelihoods
+        return seq.transpose(0, 1), seqLogprobs.transpose(0, 1)
+
     def _sample(self, fc_feats, att_feats, att_masks=None, opt={}):
-        sample_method = opt.get('sample_method', 'greedy')
+        sample_max = opt.get('sample_max', 1)
         beam_size = opt.get('beam_size', 1)
         temperature = opt.get('temperature', 1.0)
         if beam_size > 1:
@@ -142,7 +170,7 @@ class ShowTellModel(CaptionModel):
             # sample the next word
             if t == self.seq_length + 1: # skip if we achieve maximum length
                 break
-            if sample_method == 'greedy':
+            if sample_max:
                 sampleLogprobs, it = torch.max(logprobs.data, 1)
                 it = it.view(-1).long()
             else:

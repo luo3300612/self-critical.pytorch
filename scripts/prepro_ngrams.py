@@ -27,6 +27,8 @@ import os
 import json
 import argparse
 from six.moves import cPickle
+import sys
+sys.path.append('/userhome/self-critical2/self-critical.pytorch')
 import misc.utils as utils
 from collections import defaultdict
 
@@ -94,8 +96,6 @@ def build_dict(imgs, wtoi, params):
       ref_words = []
       ref_idxs = []
       for sent in img['sentences']:
-        if hasattr(params, 'bpe'):
-          sent['tokens'] = params.bpe.segment(' '.join(sent['tokens'])).strip().split(' ')
         tmp_tokens = sent['tokens'] + ['<eos>']
         tmp_tokens = [_ if _ in wtoi else 'UNK' for _ in tmp_tokens]
         ref_words.append(' '.join(tmp_tokens))
@@ -112,28 +112,15 @@ def build_dict(imgs, wtoi, params):
 def main(params):
 
   imgs = json.load(open(params['input_json'], 'r'))
-  dict_json = json.load(open(params['dict_json'], 'r'))
-  itow = dict_json['ix_to_word']
+  itow = json.load(open(params['dict_json'], 'r'))['ix_to_word']
   wtoi = {w:i for i,w in itow.items()}
-
-  # Load bpe
-  if 'bpe' in dict_json:
-    import tempfile
-    import codecs
-    codes_f = tempfile.NamedTemporaryFile(delete=False)
-    codes_f.close()
-    with open(codes_f.name, 'w') as f:
-      f.write(dict_json['bpe'])
-    with codecs.open(codes_f.name, encoding='UTF-8') as codes:
-      bpe = apply_bpe.BPE(codes)
-    params.bpe = bpe
 
   imgs = imgs['images']
 
   ngram_words, ngram_idxs, ref_len = build_dict(imgs, wtoi, params)
 
-  utils.pickle_dump({'document_frequency': ngram_words, 'ref_len': ref_len}, open(params['output_pkl']+'-words.p','w'))
-  utils.pickle_dump({'document_frequency': ngram_idxs, 'ref_len': ref_len}, open(params['output_pkl']+'-idxs.p','w'))
+  utils.pickle_dump({'document_frequency': ngram_words, 'ref_len': ref_len}, open(params['output_pkl']+'-words.p','w'),)# protocol=cPickle.HIGHEST_PROTOCOL)
+  utils.pickle_dump({'document_frequency': ngram_idxs, 'ref_len': ref_len}, open(params['output_pkl']+'-idxs.p','w'),)# protocol=cPickle.HIGHEST_PROTOCOL)
 
 if __name__ == "__main__":
 

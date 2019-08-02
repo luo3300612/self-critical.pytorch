@@ -22,15 +22,18 @@ import misc.utils as utils
 from misc.rewards import init_scorer, get_self_critical_reward
 from misc.loss_wrapper import LossWrapper
 
+os.environ["HDF5_USE_FILE_LOCKING"] = 'FALSE'
 try:
     import tensorboardX as tb
 except ImportError:
     print("tensorboardX is not installed")
     tb = None
 
+
 def add_summary_value(writer, key, value, iteration):
     if writer:
         writer.add_scalar(key, value, iteration)
+
 
 def train(opt):
     # Deal with feature things before anything
@@ -47,15 +50,16 @@ def train(opt):
     histories = {}
     if opt.start_from is not None:
         # open old infos and check if models are compatible
-        with open(os.path.join(opt.start_from, 'infos_'+opt.id+'.pkl'), 'rb') as f:
+        with open(os.path.join(opt.start_from, 'infos_' + opt.id + '.pkl'), 'rb') as f:
             infos = utils.pickle_load(f)
             saved_model_opt = infos['opt']
-            need_be_same=["caption_model", "rnn_type", "rnn_size", "num_layers"]
+            need_be_same = ["caption_model", "rnn_type", "rnn_size", "num_layers"]
             for checkme in need_be_same:
-                assert vars(saved_model_opt)[checkme] == vars(opt)[checkme], "Command line argument and saved model disagree on '%s' " % checkme
+                assert vars(saved_model_opt)[checkme] == vars(opt)[
+                    checkme], "Command line argument and saved model disagree on '%s' " % checkme
 
-        if os.path.isfile(os.path.join(opt.start_from, 'histories_'+opt.id+'.pkl')):
-            with open(os.path.join(opt.start_from, 'histories_'+opt.id+'.pkl'), 'rb') as f:
+        if os.path.isfile(os.path.join(opt.start_from, 'histories_' + opt.id + '.pkl')):
+            with open(os.path.join(opt.start_from, 'histories_' + opt.id + '.pkl'), 'rb') as f:
                 histories = utils.pickle_load(f)
     else:
         infos['iter'] = 0
@@ -78,9 +82,7 @@ def train(opt):
     if opt.load_best_score == 1:
         best_val_score = infos.get('best_val_score', None)
 
-    opt.vocab = loader.get_vocab()
     model = models.setup(opt).cuda()
-    del opt.vocab
     dp_model = torch.nn.DataParallel(model)
     lw_model = LossWrapper(model, opt)
     dp_lw_model = torch.nn.DataParallel(lw_model)
@@ -99,9 +101,8 @@ def train(opt):
     else:
         optimizer = utils.build_optimizer(model.parameters(), opt)
     # Load the optimizer
-    if vars(opt).get('start_from', None) is not None and os.path.isfile(os.path.join(opt.start_from,"optimizer.pth")):
+    if vars(opt).get('start_from', None) is not None and os.path.isfile(os.path.join(opt.start_from, "optimizer.pth")):
         optimizer.load_state_dict(torch.load(os.path.join(opt.start_from, 'optimizer.pth')))
-
 
     def save_checkpoint(model, infos, optimizer, histories=None, append=''):
         if len(append) > 0:
@@ -109,15 +110,15 @@ def train(opt):
         # if checkpoint_path doesn't exist
         if not os.path.isdir(opt.checkpoint_path):
             os.makedirs(opt.checkpoint_path)
-        checkpoint_path = os.path.join(opt.checkpoint_path, 'model%s.pth' %(append))
+        checkpoint_path = os.path.join(opt.checkpoint_path, 'model%s.pth' % (append))
         torch.save(model.state_dict(), checkpoint_path)
         print("model saved to {}".format(checkpoint_path))
-        optimizer_path = os.path.join(opt.checkpoint_path, 'optimizer%s.pth' %(append))
+        optimizer_path = os.path.join(opt.checkpoint_path, 'optimizer%s.pth' % (append))
         torch.save(optimizer.state_dict(), optimizer_path)
-        with open(os.path.join(opt.checkpoint_path, 'infos_'+opt.id+'%s.pkl' %(append)), 'wb') as f:
+        with open(os.path.join(opt.checkpoint_path, 'infos_' + opt.id + '%s.pkl' % (append)), 'wb') as f:
             utils.pickle_dump(infos, f)
         if histories:
-            with open(os.path.join(opt.checkpoint_path, 'histories_'+opt.id+'%s.pkl' %(append)), 'wb') as f:
+            with open(os.path.join(opt.checkpoint_path, 'histories_' + opt.id + '%s.pkl' % (append)), 'wb') as f:
                 utils.pickle_dump(histories, f)
 
     try:
@@ -127,15 +128,15 @@ def train(opt):
                     # Assign the learning rate
                     if epoch > opt.learning_rate_decay_start and opt.learning_rate_decay_start >= 0:
                         frac = (epoch - opt.learning_rate_decay_start) // opt.learning_rate_decay_every
-                        decay_factor = opt.learning_rate_decay_rate  ** frac
+                        decay_factor = opt.learning_rate_decay_rate ** frac
                         opt.current_lr = opt.learning_rate * decay_factor
                     else:
                         opt.current_lr = opt.learning_rate
-                    utils.set_lr(optimizer, opt.current_lr) # set the decayed rate
+                    utils.set_lr(optimizer, opt.current_lr)  # set the decayed rate
                 # Assign the scheduled sampling prob
                 if epoch > opt.scheduled_sampling_start and opt.scheduled_sampling_start >= 0:
                     frac = (epoch - opt.scheduled_sampling_start) // opt.scheduled_sampling_increase_every
-                    opt.ss_prob = min(opt.scheduled_sampling_increase_prob  * frac, opt.scheduled_sampling_max_prob)
+                    opt.ss_prob = min(opt.scheduled_sampling_increase_prob * frac, opt.scheduled_sampling_max_prob)
                     model.ss_prob = opt.ss_prob
 
                 # If start self critical training
@@ -146,7 +147,7 @@ def train(opt):
                     sc_flag = False
 
                 epoch_done = False
-                    
+
             start = time.time()
             # Load data from train split (0)
             data = loader.get_batch('train')
@@ -158,9 +159,10 @@ def train(opt):
             tmp = [data['fc_feats'], data['att_feats'], data['labels'], data['masks'], data['att_masks']]
             tmp = [_ if _ is None else _.cuda() for _ in tmp]
             fc_feats, att_feats, labels, masks, att_masks = tmp
-            
+
             optimizer.zero_grad()
-            model_out = dp_lw_model(fc_feats, att_feats, labels, masks, att_masks, data['gts'], torch.arange(0, len(data['gts'])), sc_flag)
+            model_out = dp_lw_model(fc_feats, att_feats, labels, masks, att_masks, data['gts'],
+                                    torch.arange(0, len(data['gts'])), sc_flag)
 
             loss = model_out['loss'].mean()
 
@@ -172,10 +174,10 @@ def train(opt):
             end = time.time()
             if not sc_flag:
                 print("iter {} (epoch {}), train_loss = {:.3f}, time/batch = {:.3f}" \
-                    .format(iteration, epoch, train_loss, end - start))
+                      .format(iteration, epoch, train_loss, end - start))
             else:
                 print("iter {} (epoch {}), avg_reward = {:.3f}, time/batch = {:.3f}" \
-                    .format(iteration, epoch, model_out['reward'].mean(), end - start))
+                      .format(iteration, epoch, model_out['reward'].mean(), end - start))
 
             # Update the iteration and epoch
             iteration += 1
@@ -204,12 +206,12 @@ def train(opt):
             infos['epoch'] = epoch
             infos['iterators'] = loader.iterators
             infos['split_ix'] = loader.split_ix
-            
+
             # make evaluation on validation set, and save model
             if (iteration % opt.save_checkpoint_every == 0):
                 # eval model
                 eval_kwargs = {'split': 'val',
-                                'dataset': opt.input_json}
+                               'dataset': opt.input_json}
                 eval_kwargs.update(vars(opt))
                 val_loss, predictions, lang_stats = eval_utils.eval_split(
                     dp_model, lw_model.crit, loader, eval_kwargs)
@@ -222,7 +224,7 @@ def train(opt):
                 # Write validation result into summary
                 add_summary_value(tb_summary_writer, 'validation loss', val_loss, iteration)
                 if lang_stats is not None:
-                    for k,v in lang_stats.items():
+                    for k, v in lang_stats.items():
                         add_summary_value(tb_summary_writer, k, v, iteration)
                 val_result_history[iteration] = {'loss': val_loss, 'lang_stats': lang_stats, 'predictions': predictions}
 
